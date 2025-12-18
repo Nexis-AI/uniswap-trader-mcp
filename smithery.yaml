@@ -7,18 +7,51 @@ startCommand:
     type: object
     required:
       - infuraKey
-      - walletPrivateKey
+      - safeAddress
+      - safeAgentPrivateKey
     properties:
       infuraKey:
         type: string
         description: Infura API key for RPC endpoints
-      walletPrivateKey:
+      safeAddress:
         type: string
-        description: Private key of the wallet for executing swaps
+        description: Safe Smart Account address that holds funds (same address on all supported chains if deployed deterministically)
+      safeAddressesJson:
+        type: string
+        description: Optional JSON mapping chainId -> Safe address (overrides safeAddress for specific chains)
+      safeAgentPrivateKey:
+        type: string
+        description: Private key for the Safe agent signer (must be an owner on the Safe for autonomous execution)
+      maxSlippagePct:
+        type: number
+        description: Optional safety cap for slippageTolerance (%). Defaults to 1.
+      maxDeadlineMinutes:
+        type: number
+        description: Optional safety cap for deadline (minutes). Defaults to 30.
+      requireZeroResetApprove:
+        type: boolean
+        description: If true, reset ERC20 allowance to 0 before setting a new allowance (safer for USDT-like tokens). Defaults to true.
   commandFunction:
     # A JS function that produces the CLI command based on the given config to start the MCP on stdio.
     |-
-    (config) => ({ command: 'node', args: ['index.js'], env: { INFURA_KEY: config.infuraKey, WALLET_PRIVATE_KEY: config.walletPrivateKey } })
+    (config) => ({
+      command: 'node',
+      args: ['index.js'],
+      env: {
+        INFURA_KEY: config.infuraKey,
+        SAFE_ADDRESS: config.safeAddress,
+        SAFE_ADDRESSES_JSON: config.safeAddressesJson,
+        SAFE_AGENT_PRIVATE_KEY: config.safeAgentPrivateKey,
+        UNISWAP_MAX_SLIPPAGE_PCT: config.maxSlippagePct,
+        UNISWAP_MAX_DEADLINE_MINUTES: config.maxDeadlineMinutes,
+        UNISWAP_REQUIRE_ZERO_RESET_APPROVE: config.requireZeroResetApprove
+      }
+    })
   exampleConfig:
     infuraKey: abcd1234abcd1234abcd1234abcd1234
-    walletPrivateKey: "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    safeAddress: "0x0000000000000000000000000000000000000000"
+    safeAddressesJson: "{\"1\":\"0x0000000000000000000000000000000000000000\"}"
+    safeAgentPrivateKey: "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    maxSlippagePct: 1
+    maxDeadlineMinutes: 30
+    requireZeroResetApprove: true

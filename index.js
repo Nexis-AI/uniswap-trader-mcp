@@ -2,6 +2,9 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { z } = require("zod");
 const ethers = require("ethers");
+const SafeProtocolKit = require("@safe-global/protocol-kit");
+const Safe = SafeProtocolKit.default ?? SafeProtocolKit;
+const { OperationType } = require("@safe-global/types-kit");
 const { 
   Token,
   CurrencyAmount,
@@ -14,6 +17,7 @@ const { AlphaRouter, SwapType } = require("@uniswap/smart-order-router");
 // Define minimal ERC20 ABI with decimals function added
 const ERC20ABI = [
   "function balanceOf(address account) external view returns (uint256)",
+  "function allowance(address owner, address spender) external view returns (uint256)",
   "function approve(address spender, uint256 amount) external returns (bool)",
   "function symbol() external view returns (string)",
   "function decimals() external view returns (uint8)"
@@ -40,15 +44,68 @@ const CHAIN_CONFIGS = require('./chainConfigs');
 // Import utilities from ethers.utils for v5
 const { parseUnits, formatUnits } = ethers.utils;
 
-const WALLET_PRIVATE_KEY = process.env.WALLET_PRIVATE_KEY;
-if (!WALLET_PRIVATE_KEY) {
-  throw new Error("WALLET_PRIVATE_KEY environment variable is required");
+const ERC20_INTERFACE = new ethers.utils.Interface(ERC20ABI);
+
+function getSafeAgentPrivateKey() {
+  const pk = process.env.SAFE_AGENT_PRIVATE_KEY;
+  if (!pk) {
+    throw new Error(
+      "SAFE_AGENT_PRIVATE_KEY environment variable is required for executeSwap (Safe agent signer)."
+    );
+  }
+  return pk;
+}
+
+function parseSafeAddressesJson(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("SAFE_ADDRESSES_JSON must be a JSON object mapping chainId -> Safe address");
+    }
+    return parsed;
+  } catch (error) {
+    throw new Error(`Failed to parse SAFE_ADDRESSES_JSON: ${error.message}`);
+  }
+}
+
+function getSafeAddressForChain(chainId) {
+  const chainSpecific = process.env[`SAFE_ADDRESS_${chainId}`];
+  if (chainSpecific) return ethers.utils.getAddress(chainSpecific);
+
+  const fromJson = parseSafeAddressesJson(process.env.SAFE_ADDRESSES_JSON);
+  if (fromJson && (fromJson[chainId] || fromJson[String(chainId)])) {
+    const addr = fromJson[chainId] ?? fromJson[String(chainId)];
+    return ethers.utils.getAddress(addr);
+  }
+
+  const single = process.env.SAFE_ADDRESS;
+  if (single) return ethers.utils.getAddress(single);
+
+  throw new Error(
+    `Missing Safe address for chainId ${chainId}. Set SAFE_ADDRESS (single), SAFE_ADDRESS_${chainId}, or SAFE_ADDRESSES_JSON (JSON mapping).`
+  );
+}
+
+function getGuardrails() {
+  const maxSlippagePct = Number(process.env.UNISWAP_MAX_SLIPPAGE_PCT ?? "1");
+  const maxDeadlineMinutes = Number(process.env.UNISWAP_MAX_DEADLINE_MINUTES ?? "30");
+  const requireZeroResetApprove = (process.env.UNISWAP_REQUIRE_ZERO_RESET_APPROVE ?? "true").toLowerCase() === "true";
+
+  if (!Number.isFinite(maxSlippagePct) || maxSlippagePct <= 0 || maxSlippagePct > 50) {
+    throw new Error("UNISWAP_MAX_SLIPPAGE_PCT must be a number between (0, 50].");
+  }
+  if (!Number.isFinite(maxDeadlineMinutes) || maxDeadlineMinutes <= 0 || maxDeadlineMinutes > 24 * 60) {
+    throw new Error("UNISWAP_MAX_DEADLINE_MINUTES must be a number between (0, 1440].");
+  }
+
+  return { maxSlippagePct, maxDeadlineMinutes, requireZeroResetApprove };
 }
 
 // Initialize MCP server
 const server = new McpServer({
   name: "Uniswap Trader MCP",
-  version: "1.0.0",
+  version: "2.0.0",
   description: "An MCP server for AI agents to automate trading strategies on Uniswap DEX across multiple blockchains"
 });
 
@@ -74,24 +131,34 @@ async function createToken(chainId, address, provider, symbol = "UNKNOWN", name 
   }
   const tokenContract = new ethers.Contract(address, ERC20ABI, provider);
   const decimals = await tokenContract.decimals();
-  console.log('=>', decimals)
   return new Token(chainId, ethers.utils.getAddress(address), decimals, symbol, name);
 }
 
-// Check wallet balance, throw error if zero
-async function checkBalance(provider, wallet, tokenAddress, isNative = false) {
+// Check balance, throw error if insufficient for the intended action
+async function assertHasBalance(provider, accountAddress, tokenAddress, requiredAmountWei, isNative = false) {
+  const required = ethers.BigNumber.from(requiredAmountWei ?? "0");
+  if (required.lte(0)) return;
+
   if (isNative) {
-    const balance = await provider.getBalance(wallet.address);
-    if (balance.isZero()) {
-      throw new Error(`Zero ${CHAIN_CONFIGS[provider.network.chainId].name} native token balance. Please deposit funds to ${wallet.address}.`);
+    const balance = await provider.getBalance(accountAddress);
+    if (balance.lt(required)) {
+      throw new Error(
+        `Insufficient native balance. Required ${formatUnits(required, 18)}; have ${formatUnits(balance, 18)} at ${accountAddress}.`
+      );
     }
-  } else {
-    const tokenContract = new ethers.Contract(tokenAddress, ERC20ABI, provider);
-    const balance = await tokenContract.balanceOf(wallet.address);
-    if (balance.isZero()) {
-      const symbol = await tokenContract.symbol();
-      throw new Error(`Zero ${symbol} balance. Please deposit funds to ${wallet.address}.`);
-    }
+    return;
+  }
+
+  const tokenContract = new ethers.Contract(tokenAddress, ERC20ABI, provider);
+  const [balance, symbol, decimals] = await Promise.all([
+    tokenContract.balanceOf(accountAddress),
+    tokenContract.symbol(),
+    tokenContract.decimals(),
+  ]);
+  if (balance.lt(required)) {
+    throw new Error(
+      `Insufficient ${symbol} balance. Required ${formatUnits(required, decimals)}; have ${formatUnits(balance, decimals)} at ${accountAddress}.`
+    );
   }
 }
 
@@ -169,7 +236,7 @@ server.tool(
 // Tool: Execute swap with Smart Order Router
 server.tool(
   "executeSwap",
-  "Execute a swap on Uniswap with optimal multi-hop routing",
+  "Prepare or execute a swap on Uniswap via a Safe Smart Account (agent-based execution with guardrails)",
   {
     chainId: z.number().default(1).describe("Chain ID (1: Ethereum, 10: Optimism, 137: Polygon, 42161: Arbitrum, 42220: Celo, 56: BNB Chain, 43114: Avalanche, 8453: Base)"),
     tokenIn: z.string().describe("Input token address ('NATIVE' for native token like ETH)"),
@@ -178,12 +245,39 @@ server.tool(
     amountOut: z.string().optional().describe("Exact output amount (required for exactOut trades)"),
     tradeType: z.enum(["exactIn", "exactOut"]).default("exactIn").describe("Trade type: exactIn requires amountIn, exactOut requires amountOut"),
     slippageTolerance: z.number().optional().default(0.5).describe("Slippage tolerance in percentage"),
-    deadline: z.number().optional().default(20).describe("Transaction deadline in minutes")
+    deadline: z.number().optional().default(20).describe("Transaction deadline in minutes"),
+    mode: z.enum(["prepare", "execute"]).optional().default("prepare").describe("prepare returns Safe transaction details; execute broadcasts on-chain (requires Safe threshold=1 or enough signatures)")
   },
-  async ({ chainId, tokenIn, tokenOut, amountIn, amountOut, tradeType, slippageTolerance, deadline }) => {
+  async ({ chainId, tokenIn, tokenOut, amountIn, amountOut, tradeType, slippageTolerance, deadline, mode }) => {
     try {
       const { provider, router, config } = getChainContext(chainId);
-      const wallet = new ethers.Wallet(WALLET_PRIVATE_KEY, provider);
+      const guardrails = getGuardrails();
+      if (slippageTolerance > guardrails.maxSlippagePct) {
+        throw new Error(
+          `slippageTolerance ${slippageTolerance}% exceeds UNISWAP_MAX_SLIPPAGE_PCT ${guardrails.maxSlippagePct}%.`
+        );
+      }
+      if (deadline > guardrails.maxDeadlineMinutes) {
+        throw new Error(
+          `deadline ${deadline} minutes exceeds UNISWAP_MAX_DEADLINE_MINUTES ${guardrails.maxDeadlineMinutes} minutes.`
+        );
+      }
+
+      const safeAddress = getSafeAddressForChain(chainId);
+      const agentPrivateKey = getSafeAgentPrivateKey();
+      const agentAddress = new ethers.Wallet(agentPrivateKey).address;
+
+      const protocolKit = await Safe.init({
+        provider: config.rpcUrl,
+        signer: agentPrivateKey,
+        safeAddress,
+      });
+
+      const isSafeDeployed = await protocolKit.isSafeDeployed();
+      if (!isSafeDeployed) throw new Error(`Safe not deployed on chainId ${chainId} at ${safeAddress}`);
+
+      const [owners, threshold] = await Promise.all([protocolKit.getOwners(), protocolKit.getThreshold()]);
+      const isAgentOwner = owners.map((o) => o.toLowerCase()).includes(agentAddress.toLowerCase());
 
       const isNativeIn = !tokenIn || tokenIn.toLowerCase() === "native";
       const isNativeOut = !tokenOut || tokenOut.toLowerCase() === "native";
@@ -202,6 +296,9 @@ server.tool(
       const decimals = tradeType === "exactIn" ? tokenA.decimals : tokenB.decimals;
       const amountWei = parseUnits(amount, decimals).toString();
       
+      const slippagePercent = new Percent(Math.floor(slippageTolerance * 100), 10000);
+      const deadlineSeconds = Math.floor(Date.now() / 1000) + (deadline * 60);
+
       const route = await router.route(
         CurrencyAmount.fromRawAmount(
           tradeType === "exactIn" ? tokenA : tokenB,
@@ -210,69 +307,135 @@ server.tool(
         tradeType === "exactIn" ? tokenB : tokenA,
         tradeType === "exactIn" ? TradeType.EXACT_INPUT : TradeType.EXACT_OUTPUT,
         {
-          recipient: isNativeOut ? wallet.address : config.swapRouter,
-          slippageTolerance: new Percent(Math.floor(slippageTolerance * 100), 10000),
-          deadline: Math.floor(Date.now() / 1000) + (deadline * 60),
+          recipient: safeAddress,
+          slippageTolerance: slippagePercent,
+          deadline: deadlineSeconds,
           type: SwapType.SWAP_ROUTER_02,
         }
       );
 
       if (!route) throw new Error("No route found");
 
-      // Check balance before swap
-      await checkBalance(provider, wallet, isNativeIn ? null : tokenA.address, isNativeIn);
+      const maxInput = route.trade.maximumAmountIn(slippagePercent);
+      const maxInputWei = maxInput.quotient.toString();
+      const swapValueWei = isNativeIn ? maxInputWei : route.methodParameters.value;
 
-      const swapRouter = new ethers.Contract(config.swapRouter, SwapRouterABI, wallet);
-      const wethContract = new ethers.Contract(config.weth, WETHABI, wallet);
+      // Check balance before swap (exactOut needs up to maxInput)
+      await assertHasBalance(provider, safeAddress, isNativeIn ? null : tokenA.address, maxInputWei, isNativeIn);
+
+      const metaTxs = [];
 
       // Approve token if not native input
       if (!isNativeIn) {
-        const tokenContract = new ethers.Contract(tokenA.address, ERC20ABI, wallet);
-        const approvalTx = await tokenContract.approve(config.swapRouter, ethers.constants.MaxUint256);
-        await approvalTx.wait();
+        const tokenContractRead = new ethers.Contract(tokenA.address, ERC20ABI, provider);
+        const currentAllowance = await tokenContractRead.allowance(safeAddress, config.swapRouter);
+        const requiredAllowance = ethers.BigNumber.from(maxInputWei);
+
+        if (currentAllowance.lt(requiredAllowance)) {
+          if (guardrails.requireZeroResetApprove && !currentAllowance.isZero()) {
+            metaTxs.push({
+              to: tokenA.address,
+              value: "0",
+              data: ERC20_INTERFACE.encodeFunctionData("approve", [config.swapRouter, "0"]),
+              operation: OperationType.Call,
+            });
+          }
+          metaTxs.push({
+            to: tokenA.address,
+            value: "0",
+            data: ERC20_INTERFACE.encodeFunctionData("approve", [config.swapRouter, maxInputWei]),
+            operation: OperationType.Call,
+          });
+        }
       }
 
-      let tx;
+      // Swap meta-transaction (router handles wrapping/unwrapping via calldata when needed)
+      metaTxs.push({
+        to: config.swapRouter,
+        value: swapValueWei,
+        data: route.methodParameters.calldata,
+        operation: OperationType.Call,
+      });
+
+      // For exactOut native output, unwrap WETH -> native ETH inside the Safe
       if (isNativeOut && tradeType === "exactOut") {
-        // Execute swap to receive WETH
-        tx = await wallet.sendTransaction({
-          to: config.swapRouter,
-          data: route.methodParameters.calldata,
-          value: route.methodParameters.value,
-          gasLimit: route.estimatedGasUsed.mul(12).div(10),
-          gasPrice: (await provider.getGasPrice()).mul(2)
+        metaTxs.push({
+          to: config.weth,
+          value: "0",
+          data: new ethers.utils.Interface(WETHABI).encodeFunctionData("withdraw", [amountWei]),
+          operation: OperationType.Call,
         });
-        const receipt = await tx.wait();
-        
-        // Convert WETH to native token
-        const wethAmount = route.trade.outputAmount.quotient;
-        const withdrawTx = await wethContract.withdraw(wethAmount);
-        await withdrawTx.wait();
-      } else {
-        // Execute swap directly, native input handled by SwapRouter via value
-        tx = await wallet.sendTransaction({
-          to: config.swapRouter,
-          data: route.methodParameters.calldata,
-          value: isNativeIn && tradeType === "exactIn" ? amountWei : route.methodParameters.value,
-          gasLimit: route.estimatedGasUsed.mul(12).div(10),
-          gasPrice: (await provider.getGasPrice()).mul(2)
-        });
-        await tx.wait();
       }
 
-      const receipt = await tx.wait();
+      const safeTx = await protocolKit.createTransaction({
+        transactions: metaTxs,
+        onlyCalls: true,
+      });
+
+      const safeTxHash = await protocolKit.getTransactionHash(safeTx);
+      const safeSignature = await protocolKit.signHash(safeTxHash);
+
+      if (mode === "prepare") {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              chainId,
+              safeAddress,
+              agentAddress,
+              isAgentOwner,
+              safeThreshold: threshold,
+              mode,
+              tradeType,
+              fromToken: isNativeIn ? "NATIVE" : tokenIn,
+              toToken: isNativeOut ? "NATIVE" : tokenOut,
+              inputAmount: route.trade.inputAmount.toSignificant(6),
+              outputAmount: route.trade.outputAmount.toSignificant(6),
+              minimumReceived: route.trade.minimumAmountOut(slippagePercent).toSignificant(6),
+              maximumInput: route.trade.maximumAmountIn(slippagePercent).toSignificant(6),
+              slippageTolerancePct: slippageTolerance,
+              deadlineSeconds,
+              safeTxHash,
+              safeSignature: { signer: safeSignature.signer, data: safeSignature.data, isContractSignature: safeSignature.isContractSignature },
+              metaTransactions: metaTxs,
+              estimatedGas: route.estimatedGasUsed.toString(),
+              route: route.trade.swaps.map(swap => ({
+                tokenIn: swap.inputAmount.currency.address,
+                tokenOut: swap.outputAmount.currency.address,
+                fee: swap.route.pools[0].fee
+              }))
+            }, null, 2)
+          }]
+        };
+      }
+
+      if (threshold > 1) {
+        throw new Error(
+          `Safe threshold is ${threshold}; cannot execute with a single agent signature. Use mode=prepare and collect additional signatures, then execute via Safe.`
+        );
+      }
+      if (!isAgentOwner) {
+        throw new Error(
+          `Agent signer ${agentAddress} is not an owner of Safe ${safeAddress} on chainId ${chainId}.`
+        );
+      }
+
+      const txResponse = await protocolKit.executeTransaction(safeTx);
+      const receipt = await provider.waitForTransaction(txResponse.hash);
 
       return {
         content: [{
           type: "text",
           text: JSON.stringify({
             chainId,
-            txHash: receipt.transactionHash,
+            safeAddress,
+            safeTxHash,
+            txHash: txResponse.hash,
             tradeType,
             amountIn: route.trade.inputAmount.toSignificant(6),
             outputAmount: route.trade.outputAmount.toSignificant(6),
-            minimumReceived: route.trade.minimumAmountOut(new Percent(Math.floor(slippageTolerance * 100), 10000)).toSignificant(6),
-            maximumInput: route.trade.maximumAmountIn(new Percent(Math.floor(slippageTolerance * 100), 10000)).toSignificant(6),
+            minimumReceived: route.trade.minimumAmountOut(slippagePercent).toSignificant(6),
+            maximumInput: route.trade.maximumAmountIn(slippagePercent).toSignificant(6),
             fromToken: isNativeIn ? "NATIVE" : tokenIn,
             toToken: isNativeOut ? "NATIVE" : tokenOut,
             route: route.trade.swaps.map(swap => ({
@@ -280,7 +443,7 @@ server.tool(
               tokenOut: swap.outputAmount.currency.address,
               fee: swap.route.pools[0].fee
             })),
-            gasUsed: receipt.gasUsed.toString()
+            gasUsed: receipt?.gasUsed?.toString?.() ?? null
           }, null, 2)
         }]
       };
@@ -320,4 +483,12 @@ async function startServer() {
   }
 }
 
-startServer();
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  getSafeAddressForChain,
+  parseSafeAddressesJson,
+  getGuardrails,
+};

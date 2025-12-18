@@ -10,9 +10,10 @@ An MCP server for AI agents to automate token swaps on Uniswap DEX across multip
 - **Multi-Chain Support**: Compatible with Ethereum, Optimism, Polygon, Arbitrum, Celo, BNB Chain, Avalanche, and Base.
 
 ## Prerequisites
-- **Node.js**: Version 14.x or higher.
+- **Node.js**: Version 18.x or higher.
 - **npm**: For package management.
-- **Wallet**: A funded wallet with a private key for executing swaps.
+- **Safe Smart Account**: A deployed and funded Safe Smart Account (holds funds).
+- **Safe Agent Signer**: A signer key that is an **owner** on the Safe (for autonomous execution).
 - **RPC Endpoints**: Access to blockchain RPC URLs (e.g., Infura, Alchemy) for supported chains.
 
 ## Installation
@@ -47,7 +48,12 @@ npx -y @smithery/cli install @kukapay/uniswap-trader-mcp --client claude
       "args": ["path/to/uniswap-trader-mcp/server/index.js"],
       "env": {
         "INFURA_KEY": "your infura key",
-        "WALLET_PRIVATE_KEY": "your private key"
+        "SAFE_ADDRESS": "your safe address (all chains, if deterministically deployed)",
+        "SAFE_ADDRESSES_JSON": "{\"1\":\"0x...\",\"42161\":\"0x...\"}",
+        "SAFE_AGENT_PRIVATE_KEY": "agent signer private key (Safe owner)",
+        "UNISWAP_MAX_SLIPPAGE_PCT": "1",
+        "UNISWAP_MAX_DEADLINE_MINUTES": "30",
+        "UNISWAP_REQUIRE_ZERO_RESET_APPROVE": "true"
       }
     }
   }
@@ -112,7 +118,8 @@ Output:
 ```
 
 #### 2. `executeSwap`
-Executes a swap on Uniswap.
+Prepares or executes a swap on Uniswap **via a Safe Smart Account** (agent-based execution).  
+Default behavior is **prepare-only**; set `mode: "execute"` to broadcast on-chain.
 
 **Schema**:
 - `chainId`: Number (default: 1)
@@ -123,11 +130,12 @@ Executes a swap on Uniswap.
 - `tradeType`: `"exactIn"` or `"exactOut"` (default: `"exactIn"`)
 - `slippageTolerance`: Number (default: 0.5, in percentage)
 - `deadline`: Number (default: 20, in minutes)
+- `mode`: `"prepare"` or `"execute"` (default: `"prepare"`)
 
 Example prompt:
 
 ```
-Swap 1 ETH for DAI on Ethereum with a 0.5% slippage tolerance and a 20-minute deadline.
+Prepare a swap of 1 ETH for DAI on Ethereum with 0.5% slippage and a 20-minute deadline.
 ```
 
 Output:
@@ -135,7 +143,9 @@ Output:
 ```
 {
   "chainId": 1,
-  "txHash": "0x1234...abcd",
+  "safeAddress": "0x...",
+  "safeTxHash": "0x...",
+  "mode": "prepare",
   "tradeType": "exactIn",
   "amountIn": "1.000000",
   "outputAmount": "2990.75",
@@ -150,7 +160,7 @@ Output:
       "fee": 3000
     }
   ],
-  "gasUsed": "145000"
+  "estimatedGas": "150000"
 }
 ```
 

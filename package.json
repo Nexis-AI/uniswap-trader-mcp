@@ -1,11 +1,16 @@
 {
   "name": "uniswap-trader-mcp",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "main": "index.js",
   "homepage": "https://github.com/kukapay/uniswap-trader-mcp",
   "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.7.0",
+    "@safe-global/protocol-kit": "^6.1.2",
+    "@safe-global/types-kit": "^3.0.0",
     "@uniswap/smart-order-router": "^4.20.10",
     "@uniswap/v3-sdk": "^3.25.2",
     "dotenv": "^16.4.7",
