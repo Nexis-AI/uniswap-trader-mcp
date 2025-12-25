@@ -46,15 +46,6 @@ const { parseUnits, formatUnits } = ethers.utils;
 
 const ERC20_INTERFACE = new ethers.utils.Interface(ERC20ABI);
 
-function getSafeAgentPrivateKey() {
-  const pk = process.env.SAFE_AGENT_PRIVATE_KEY;
-  if (!pk) {
-    throw new Error(
-      "SAFE_AGENT_PRIVATE_KEY environment variable is required for executeSwap (Safe agent signer)."
-    );
-  }
-  return pk;
-}
 
 function parseSafeAddressesJson(raw) {
   if (!raw) return null;
@@ -67,24 +58,6 @@ function parseSafeAddressesJson(raw) {
   } catch (error) {
     throw new Error(`Failed to parse SAFE_ADDRESSES_JSON: ${error.message}`);
   }
-}
-
-function getSafeAddressForChain(chainId) {
-  const chainSpecific = process.env[`SAFE_ADDRESS_${chainId}`];
-  if (chainSpecific) return ethers.utils.getAddress(chainSpecific);
-
-  const fromJson = parseSafeAddressesJson(process.env.SAFE_ADDRESSES_JSON);
-  if (fromJson && (fromJson[chainId] || fromJson[String(chainId)])) {
-    const addr = fromJson[chainId] ?? fromJson[String(chainId)];
-    return ethers.utils.getAddress(addr);
-  }
-
-  const single = process.env.SAFE_ADDRESS;
-  if (single) return ethers.utils.getAddress(single);
-
-  throw new Error(
-    `Missing Safe address for chainId ${chainId}. Set SAFE_ADDRESS (single), SAFE_ADDRESS_${chainId}, or SAFE_ADDRESSES_JSON (JSON mapping).`
-  );
 }
 
 function getGuardrails() {
@@ -246,9 +219,10 @@ server.tool(
     tradeType: z.enum(["exactIn", "exactOut"]).default("exactIn").describe("Trade type: exactIn requires amountIn, exactOut requires amountOut"),
     slippageTolerance: z.number().optional().default(0.5).describe("Slippage tolerance in percentage"),
     deadline: z.number().optional().default(20).describe("Transaction deadline in minutes"),
-    mode: z.enum(["prepare", "execute"]).optional().default("prepare").describe("prepare returns Safe transaction details; execute broadcasts on-chain (requires Safe threshold=1 or enough signatures)")
+    mode: z.enum(["prepare", "execute"]).optional().default("prepare").describe("prepare returns Safe transaction details; execute broadcasts on-chain (requires Safe threshold=1 or enough signatures)"),
+    safeAddress: z.string().optional().describe("Address of the Safe Smart Account. If not provided, defaults to server-configured SAFE_ADDRESS.")
   },
-  async ({ chainId, tokenIn, tokenOut, amountIn, amountOut, tradeType, slippageTolerance, deadline, mode }) => {
+  async ({ chainId, tokenIn, tokenOut, amountIn, amountOut, tradeType, slippageTolerance, deadline, mode, safeAddress: userSafeAddress }) => {
     try {
       const { provider, router, config } = getChainContext(chainId);
       const guardrails = getGuardrails();
@@ -263,22 +237,64 @@ server.tool(
         );
       }
 
-      const safeAddress = getSafeAddressForChain(chainId);
-      const agentPrivateKey = getSafeAgentPrivateKey();
-      const agentAddress = new ethers.Wallet(agentPrivateKey).address;
+      // Determine Safe Address: Tool argument > Chain specific env > Global env
+      let safeAddress = userSafeAddress;
+      if (!safeAddress) {
+        const chainSpecific = process.env[`SAFE_ADDRESS_${chainId}`];
+        if (chainSpecific) {
+          safeAddress = ethers.utils.getAddress(chainSpecific);
+        } else {
+             const fromJson = parseSafeAddressesJson(process.env.SAFE_ADDRESSES_JSON);
+             if (fromJson && (fromJson[chainId] || fromJson[String(chainId)])) {
+                 const addr = fromJson[chainId] ?? fromJson[String(chainId)];
+                 safeAddress = ethers.utils.getAddress(addr);
+             } else {
+                 const single = process.env.SAFE_ADDRESS;
+                 if (single) {
+                     safeAddress = ethers.utils.getAddress(single);
+                 }
+             }
+        }
+      }
+
+      if (!safeAddress) {
+         throw new Error(
+            `Missing Safe address (Safe 4337 Wallet). Please provide 'safeAddress' as an argument, or configure SAFE_ADDRESS on the server.`
+         );
+      }
+      safeAddress = ethers.utils.getAddress(safeAddress);
+
+      // Handle Agent Key (Optional)
+      const agentPrivateKey = process.env.SAFE_AGENT_PRIVATE_KEY;
+      const agentAddress = agentPrivateKey ? new ethers.Wallet(agentPrivateKey).address : null;
+
+      if (mode === "execute" && !agentPrivateKey) {
+        throw new Error("Cannot use mode='execute' because SAFE_AGENT_PRIVATE_KEY is not set on the server.");
+      }
 
       const protocolKit = await Safe.init({
         provider: config.rpcUrl,
-        signer: agentPrivateKey,
+        signer: agentPrivateKey, // Optional, can be undefined/null
         safeAddress,
       });
 
       const isSafeDeployed = await protocolKit.isSafeDeployed();
       if (!isSafeDeployed) throw new Error(`Safe not deployed on chainId ${chainId} at ${safeAddress}`);
 
-      const [owners, threshold] = await Promise.all([protocolKit.getOwners(), protocolKit.getThreshold()]);
-      const isAgentOwner = owners.map((o) => o.toLowerCase()).includes(agentAddress.toLowerCase());
-
+      // Owner check logic only if we have an agent/signer
+      let isAgentOwner = false;
+      let threshold = 1;
+      try {
+        const [owners, thr] = await Promise.all([protocolKit.getOwners(), protocolKit.getThreshold()]);
+        threshold = thr;
+        if (agentAddress) {
+            isAgentOwner = owners.map((o) => o.toLowerCase()).includes(agentAddress.toLowerCase());
+        }
+      } catch (e) {
+        // If getting owners fails, we might just proceed (could be a connection issue or limited access)
+        console.warn("Failed to fetch Safe owners/threshold:", e.message);
+      }
+      
       const isNativeIn = !tokenIn || tokenIn.toLowerCase() === "native";
       const isNativeOut = !tokenOut || tokenOut.toLowerCase() === "native";
       
@@ -321,7 +337,13 @@ server.tool(
       const swapValueWei = isNativeIn ? maxInputWei : route.methodParameters.value;
 
       // Check balance before swap (exactOut needs up to maxInput)
-      await assertHasBalance(provider, safeAddress, isNativeIn ? null : tokenA.address, maxInputWei, isNativeIn);
+      try {
+        await assertHasBalance(provider, safeAddress, isNativeIn ? null : tokenA.address, maxInputWei, isNativeIn);
+      } catch (balanceError) {
+         // In prepare mode, we might want to warn but allow proceeding (user might top up before executing)
+         // But asserting balance is good practice. We'll keep it but add context.
+         throw new Error(`Balance check failed: ${balanceError.message}`);
+      }
 
       const metaTxs = [];
 
@@ -373,7 +395,12 @@ server.tool(
       });
 
       const safeTxHash = await protocolKit.getTransactionHash(safeTx);
-      const safeSignature = await protocolKit.signHash(safeTxHash);
+      
+      // If we have a private key, we can try to sign. Otherwise, we just return the hash/tx data.
+      let safeSignature = null;
+      if (agentPrivateKey) {
+         safeSignature = await protocolKit.signHash(safeTxHash);
+      }
 
       if (mode === "prepare") {
         return {
@@ -382,7 +409,7 @@ server.tool(
             text: JSON.stringify({
               chainId,
               safeAddress,
-              agentAddress,
+              agentAddress: agentAddress ?? "NONE (Non-custodial)",
               isAgentOwner,
               safeThreshold: threshold,
               mode,
@@ -396,7 +423,7 @@ server.tool(
               slippageTolerancePct: slippageTolerance,
               deadlineSeconds,
               safeTxHash,
-              safeSignature: { signer: safeSignature.signer, data: safeSignature.data, isContractSignature: safeSignature.isContractSignature },
+              safeSignature: safeSignature ? { signer: safeSignature.signer, data: safeSignature.data, isContractSignature: safeSignature.isContractSignature } : null,
               metaTransactions: metaTxs,
               estimatedGas: route.estimatedGasUsed.toString(),
               route: route.trade.swaps.map(swap => ({
@@ -409,6 +436,7 @@ server.tool(
         };
       }
 
+      // Execute Mode
       if (threshold > 1) {
         throw new Error(
           `Safe threshold is ${threshold}; cannot execute with a single agent signature. Use mode=prepare and collect additional signatures, then execute via Safe.`
@@ -419,7 +447,7 @@ server.tool(
           `Agent signer ${agentAddress} is not an owner of Safe ${safeAddress} on chainId ${chainId}.`
         );
       }
-
+      // If we fell through here, we must have an agentPrivateKey (checked earlier) and it must be an owner.
       const txResponse = await protocolKit.executeTransaction(safeTx);
       const receipt = await provider.waitForTransaction(txResponse.hash);
 
@@ -488,7 +516,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  getSafeAddressForChain,
   parseSafeAddressesJson,
   getGuardrails,
 };
