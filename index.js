@@ -1,7 +1,11 @@
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
+const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
+const { createMcpExpressApp } = require("@modelcontextprotocol/sdk/server/express.js");
+const { isInitializeRequest } = require("@modelcontextprotocol/sdk/types.js");
 const { z } = require("zod");
 const ethers = require("ethers");
+const { randomUUID } = require("crypto");
 const SafeProtocolKit = require("@safe-global/protocol-kit");
 const Safe = SafeProtocolKit.default ?? SafeProtocolKit;
 const { OperationType } = require("@safe-global/types-kit");
@@ -500,8 +504,20 @@ server.prompt(
   })
 );
 
-// Start the server without Infura check
-async function startServer() {
+const resolveTransportMode = () => {
+  const explicit = (process.env.MCP_TRANSPORT || "").trim().toLowerCase();
+  if (explicit === "http" || explicit === "stdio") return explicit;
+  return process.env.PORT ? "http" : "stdio";
+};
+
+const resolvePort = () => {
+  const raw = process.env.PORT || process.env.MCP_PORT || "8080";
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : 8080;
+};
+
+// Start the server using stdio transport (default for local MCP clients)
+async function startStdioServer() {
   try {
     const transport = new StdioServerTransport();
     await server.connect(transport);
@@ -511,8 +527,89 @@ async function startServer() {
   }
 }
 
+// Start the server using Streamable HTTP transport (for hosted deployments)
+async function startHttpServer() {
+  const app = createMcpExpressApp({ host: "0.0.0.0" });
+  const port = resolvePort();
+  const transports = new Map();
+
+  app.get("/health", (_req, res) => {
+    res.status(200).json({ ok: true });
+  });
+
+  const ensureTransport = async (sessionId, body) => {
+    if (sessionId && transports.has(sessionId)) {
+      return transports.get(sessionId);
+    }
+
+    if (!sessionId && isInitializeRequest(body)) {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (newSessionId) => {
+          transports.set(newSessionId, transport);
+        },
+      });
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) transports.delete(sid);
+      };
+
+      await server.connect(transport);
+      return transport;
+    }
+
+    return null;
+  };
+
+  const handleMcpRequest = async (req, res) => {
+    const sessionIdHeader = req.headers["mcp-session-id"];
+    const sessionId = Array.isArray(sessionIdHeader) ? sessionIdHeader[0] : sessionIdHeader;
+
+    try {
+      const transport = await ensureTransport(sessionId, req.body);
+      if (!transport) {
+        res.status(400).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Bad Request: missing or invalid session" },
+          id: null,
+        });
+        return;
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error("Error handling MCP request:", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: null,
+        });
+      }
+    }
+  };
+
+  app.post("/mcp", handleMcpRequest);
+  app.get("/mcp", handleMcpRequest);
+  app.delete("/mcp", handleMcpRequest);
+
+  app.listen(port, (error) => {
+    if (error) {
+      console.error("Failed to start HTTP server:", error);
+      process.exit(1);
+    }
+    console.log(`Uniswap MCP HTTP server listening on port ${port}`);
+  });
+}
+
 if (require.main === module) {
-  startServer();
+  const mode = resolveTransportMode();
+  if (mode === "http") {
+    startHttpServer();
+  } else {
+    startStdioServer();
+  }
 }
 
 module.exports = {

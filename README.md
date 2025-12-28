@@ -59,6 +59,21 @@ npx -y @smithery/cli install @kukapay/uniswap-trader-mcp --client claude
   }
 }
 ```
+
+## HTTP Deployment (Hosted)
+
+For hosted environments (Railway, Fly, Render), this server automatically switches to
+Streamable HTTP when a `PORT` is set. You can also force the mode explicitly:
+
+```bash
+MCP_TRANSPORT=http PORT=8080 node index.js
+```
+
+Endpoints:
+- `POST /mcp` (Streamable HTTP MCP)
+- `GET /mcp` (SSE stream for MCP)
+- `DELETE /mcp` (Session termination)
+- `GET /health` (Health check)
 ## Usage
 
 ### Supported Chains
