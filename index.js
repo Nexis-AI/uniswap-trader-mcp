@@ -79,6 +79,26 @@ function getGuardrails() {
   return { maxSlippagePct, maxDeadlineMinutes, requireZeroResetApprove };
 }
 
+function getSafeAddressForChain(chainId) {
+  const chainSpecific = process.env[`SAFE_ADDRESS_${chainId}`];
+  if (chainSpecific) {
+    return ethers.utils.getAddress(chainSpecific);
+  }
+
+  const fromJson = parseSafeAddressesJson(process.env.SAFE_ADDRESSES_JSON);
+  if (fromJson && (fromJson[chainId] || fromJson[String(chainId)])) {
+    return ethers.utils.getAddress(fromJson[chainId] ?? fromJson[String(chainId)]);
+  }
+
+  if (process.env.SAFE_ADDRESS) {
+    return ethers.utils.getAddress(process.env.SAFE_ADDRESS);
+  }
+
+  throw new Error(
+    "Missing Safe address (Safe 4337 Wallet). Please provide 'safeAddress' as an argument, or configure SAFE_ADDRESS on the server."
+  );
+}
+
 // Initialize MCP server
 const server = new McpServer({
   name: "Uniswap Trader MCP",
@@ -241,32 +261,9 @@ server.tool(
         );
       }
 
-      // Determine Safe Address: Tool argument > Chain specific env > Global env
-      let safeAddress = userSafeAddress;
-      if (!safeAddress) {
-        const chainSpecific = process.env[`SAFE_ADDRESS_${chainId}`];
-        if (chainSpecific) {
-          safeAddress = ethers.utils.getAddress(chainSpecific);
-        } else {
-             const fromJson = parseSafeAddressesJson(process.env.SAFE_ADDRESSES_JSON);
-             if (fromJson && (fromJson[chainId] || fromJson[String(chainId)])) {
-                 const addr = fromJson[chainId] ?? fromJson[String(chainId)];
-                 safeAddress = ethers.utils.getAddress(addr);
-             } else {
-                 const single = process.env.SAFE_ADDRESS;
-                 if (single) {
-                     safeAddress = ethers.utils.getAddress(single);
-                 }
-             }
-        }
-      }
-
-      if (!safeAddress) {
-         throw new Error(
-            `Missing Safe address (Safe 4337 Wallet). Please provide 'safeAddress' as an argument, or configure SAFE_ADDRESS on the server.`
-         );
-      }
-      safeAddress = ethers.utils.getAddress(safeAddress);
+      const safeAddress = userSafeAddress
+        ? ethers.utils.getAddress(userSafeAddress)
+        : getSafeAddressForChain(chainId);
 
       // Handle Agent Key (Optional)
       const agentPrivateKey = process.env.SAFE_AGENT_PRIVATE_KEY;
@@ -613,6 +610,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  getSafeAddressForChain,
   parseSafeAddressesJson,
   getGuardrails,
 };

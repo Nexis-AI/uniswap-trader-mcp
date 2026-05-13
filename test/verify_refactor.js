@@ -36,9 +36,9 @@ try {
 const fs = require('fs');
 const content = fs.readFileSync('./index.js', 'utf8');
 
-if (content.includes('safeAddress: z.string().optional()') && 
-    content.includes('let safeAddress = userSafeAddress;') && 
-    content.includes('if (!safeAddress) {')) {
+if (content.includes('safeAddress: z.string().optional()') &&
+    content.includes('getSafeAddressForChain(chainId)') &&
+    content.includes('process.env[`SAFE_ADDRESS_${chainId}`]')) {
     console.log("TEST 2 PASSED: Code logic contains expected non-custodial patterns");
 } else {
     console.error("TEST 2 FAILED: Code logic missing expected refactor patterns");
